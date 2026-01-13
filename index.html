@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Graph Search Explorer</title>
+
+  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+
+  <style>
+    :root { --border:#ddd; --muted:#666; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    header { padding: 14px; border-bottom: 1px solid var(--border); display: grid; gap: 10px; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    input, select {
+      padding: 10px 12px; font-size: 16px; border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    input { width: min(520px, 100%); }
+    button {
+      padding: 10px 14px; font-size: 15px; cursor: pointer;
+      border: 1px solid var(--border); background: #fff; border-radius: 10px;
+    }
+    button:hover { background: #f7f7f7; }
+    .hint { color: var(--muted); font-size: 13px; }
+    #status { color: #333; font-size: 14px; }
+    #details {
+      padding: 0 2px 2px 2px;
+      color: #333;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    #details .muted { color: var(--muted); }
+    #cy { height: calc(100vh - 185px); width: 100vw; }
+    .pill { padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; background: #fafafa; }
+  </style>
+</head>
+
+<body>
+<header>
+  <div class="row">
+    <strong>Search:</strong>
+    <input id="q" type="text" placeholder="e.g. psychology" />
+    <select id="field">
+      <option value="title" selected>Title</option>
+      <option value="subject">Subject</option>
+      <option value="any">Any field</option>
+    </select>
+    <button id="searchBtn">Search</button>
+    <button id="clearBtn">Clear</button>
+    <button id="fitBtn">Fit</button>
+    <span class="pill" id="endpointPill"></span>
+  </div>
+
+  <div class="row">
+    <span class="hint">
+      Search returns <b>books only</b>. Click a <b>book</b> to reveal its <b>subjects</b>. Click a <b>subject</b> to load more books in that same subject.
+    </span>
+  </div>
+
+  <div id="status"></div>
+  <div id="details" class="hint"></div>
+</header>
+
+<div id="cy"></div>
+
+<script>
+/**
+ * Search-first graph explorer (TriplyDB SPARQL + Cytoscape)
+ * - Title default search
+ * - Friendly labels for subject URIs (e.g., Subject_LB -> LB)
+ * - Details panel
+ * - Cleaner edge labels ("matches", "subject", "has book")
+ */
+
+const ENDPOINT = "https://api.triplydb.com/datasets/Allisonmransom/deleted-records-knowledge-graph/sparql";
+document.getElementById("endpointPill").textContent = ENDPOINT;
+
+const qEl = document.getElementById("q");
+const fieldEl = document.getElementById("field");
+const statusEl = document.getElementById("status");
+const detailsEl = document.getElementById("details");
+
+function status(msg) { statusEl.textContent = msg; }
+function setDetails(html) { detailsEl.innerHTML = html || ""; }
+
+const cy = cytoscape({
+  container: document.getElementById("cy"),
+  elements: [],
+  style: [
+    { selector: "node", style: {
+        "label": "data(label)",
+        "text-wrap": "wrap",
+        "text-max-width": 190,
+        "font-size": 11
+      }
+    },
+    { selector: "node.term", style: { "font-size": 13, "border-width": 2 } },
+    { selector: "node.book", style: { } },
+    { selector: "node.subject", style: { "border-width": 2 } },
+    { selector: "edge", style: {
+        "label": "data(label)",
+        "font-size": 10,
+        "curve-style": "bezier",
+        "target-arrow-shape": "triangle"
+      }
+    },
+    { selector: ":selected", style: { "border-width": 4 } }
+  ],
+  layout: { name: "cose", animate: false }
+});
+
+function relayout() {
+  cy.layout({ name: "cose", animate: false }).run();
+  cy.fit();
+}
+
+function esc(str) {
+  return String(str).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/** Friendly labels:
+ * - URIs: use fragment, remove Subject_ prefix, underscores -> spaces, title-case
+ * - literals: truncate if long
+ */
+function shortLabel(v) {
+  if (!v) return "";
+
+  if (v.startsWith("http://") || v.startsWith("https://")) {
+    const hash = v.lastIndexOf("#");
+    const slash = v.lastIndexOf("/");
+    const cut = Math.max(hash, slash);
+    let frag = decodeURIComponent(v.slice(cut + 1)) || v;
+
+    frag = frag.replace(/^Subject[_-]/i, "");
+    frag = frag.replace(/^SUBJECT[_-]/, "");
+    frag = frag.replace(/^subj[_-]/i, "");
+    frag = frag.replace(/_/g, " ");
+    frag = frag.replace(/\s+/g, " ").trim();
+    frag = frag.replace(/\b\w/g, c => c.toUpperCase());
+
+    return frag || v;
+  }
+
+  return v.length > 80 ? v.slice(0, 77) + "…" : v;
+}
+
+function ensureNode(id, label, classes, extra={}) {
+  if (cy.getElementById(id).empty()) {
+    cy.add({ data: { id, label, ...extra }, classes });
+  }
+}
+
+function ensureEdge(id, source, target, label) {
+  if (cy.getElementById(id).empty()) {
+    cy.add({ data: { id, source, target, label } });
+  }
+}
+
+async function sparql(query) {
+  const url = ENDPOINT + "?query=" + encodeURIComponent(query);
+  const resp = await fetch(url, { headers: { "Accept": "application/sparql-results+json" } });
+  const text = await resp.text();
+
+  if (!resp.ok) {
+    console.error("HTTP", resp.status, text);
+    throw new Error(`HTTP ${resp.status}. See console.`);
+  }
+  if (text.trim().startsWith("<")) {
+    console.error("HTML instead of JSON:", text.slice(0, 400));
+    throw new Error("Endpoint returned HTML (auth/access issue).");
+  }
+  return JSON.parse(text);
+}
+
+/**
+ * Predicates (guesses) — adjust if you later want precision.
+ * You observed "prop:title" in results, so we include that IRI first.
+ * (Assumption: prop: = http://example.org/property/)
+ */
+const TITLE_PREDICATES = [
+  "http://example.org/property/title",
+  "http://example.org/property/book",
+  "http://purl.org/dc/terms/title",
+  "http://www.w3.org/2000/01/rdf-schema#label",
+  "http://schema.org/name"
+];
+
+const SUBJECT_PREDICATES = [
+  "http://example.org/property/subject",
+  "http://purl.org/dc/terms/subject",
+  "http://schema.org/about"
+];
+
+function buildSearchQuery(term, field, limit=25, offset=0) {
+  const t = esc(term);
+
+  if (field === "title") {
+    return `
+SELECT DISTINCT ?book ?label
+WHERE {
+  ?book ?p ?label .
+  VALUES ?p { ${TITLE_PREDICATES.map(u => `<${u}>`).join(" ")} }
+  FILTER(CONTAINS(LCASE(STR(?label)), LCASE("${t}")))
+}
+ORDER BY STR(?book)
+LIMIT ${limit}
+OFFSET ${offset}
+`.trim();
+  }
+
+  if (field === "subject") {
+    return `
+SELECT DISTINCT ?book ?label
+WHERE {
+  ?book ?p ?label .
+  VALUES ?p { ${SUBJECT_PREDICATES.map(u => `<${u}>`).join(" ")} }
+  FILTER(CONTAINS(LCASE(STR(?label)), LCASE("${t}")))
+}
+ORDER BY STR(?book)
+LIMIT ${limit}
+OFFSET ${offset}
+`.trim();
+  }
+
+  // any field
+  return `
+SELECT DISTINCT ?book ?label
+WHERE {
+  ?book ?p ?label .
+  FILTER(CONTAINS(LCASE(STR(?label)), LCASE("${t}")))
+}
+ORDER BY STR(?book)
+LIMIT ${limit}
+OFFSET ${offset}
+`.trim();
+}
+
+function subjectsForBookQuery(bookIri, limit=30) {
+  return `
+SELECT DISTINCT ?subj
+WHERE {
+  <${bookIri}> ?p ?subj .
+  VALUES ?p { ${SUBJECT_PREDICATES.map(u => `<${u}>`).join(" ")} }
+}
+LIMIT ${limit}
+`.trim();
+}
+
+function booksByExactSubjectValueQuery(subjectValue, limit=25) {
+  // subjectValue may be a URI or a literal; we match via string contains to be resilient
+  const t = esc(subjectValue);
+  return `
+SELECT DISTINCT ?book ?title
+WHERE {
+  ?book ?p ?subj .
+  VALUES ?p { ${SUBJECT_PREDICATES.map(u => `<${u}>`).join(" ")} }
+  FILTER(CONTAINS(LCASE(STR(?subj)), LCASE("${t}")))
+
+  OPTIONAL { ?book <http://example.org/property/title> ?title }
+  OPTIONAL { ?book <http://example.org/property/book> ?title }
+  OPTIONAL { ?book <http://www.w3.org/2000/01/rdf-schema#label> ?title }
+  OPTIONAL { ?book <http://schema.org/name> ?title }
+}
+ORDER BY STR(?book)
+LIMIT ${limit}
+`.trim();
+}
+
+// App state
+let currentTermNodeId = null;
+let currentSearch = null;
+let currentOffset = 0;
+const PAGE_SIZE = 25;
+
+async function runSearch(reset=true) {
+  const term = qEl.value.trim();
+  const field = fieldEl.value;
+
+  if (!term) { status("Type a search term."); return; }
+
+  if (reset) {
+    cy.elements().remove();
+    setDetails("");
+    currentSearch = { term, field };
+    currentOffset = 0;
+    currentTermNodeId = `term:${field}:${term.toLowerCase()}`;
+
+    ensureNode(currentTermNodeId, term, "term", { kind: "term", term, field });
+
+    status(`Searching ${field} for "${term}"…`);
+  }
+
+  const json = await sparql(buildSearchQuery(term, field, PAGE_SIZE, currentOffset));
+  const rows = json?.results?.bindings || [];
+
+  if (!rows.length && currentOffset === 0) {
+    relayout();
+    status(`No results for "${term}" in ${field}. Try "Any field" or a different keyword.`);
+    return;
+  }
+
+  let added = 0;
+  for (const row of rows) {
+    const book = row.book?.value;
+    const label = row.label?.value;
+    if (!book) continue;
+
+    ensureNode(book, shortLabel(label || book), "book", { kind: "book", iri: book });
+    ensureEdge(`${currentTermNodeId}|matches|${book}`, currentTermNodeId, book, "matches");
+    added++;
+  }
+
+  currentOffset += PAGE_SIZE;
+  relayout();
+
+  const bookCount = cy.nodes(".book").length;
+  status(`Loaded ${bookCount} result book(s) for "${term}". Click a book to reveal its subjects.`);
+  setDetails(`<b>Search:</b> ${term} <span class="muted">(field: ${field}, showing ${bookCount} books)</span>`);
+}
+
+document.getElementById("searchBtn").addEventListener("click", () => runSearch(true));
+qEl.addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(true); });
+
+document.getElementById("clearBtn").addEventListener("click", () => {
+  cy.elements().remove();
+  currentTermNodeId = null;
+  currentSearch = null;
+  currentOffset = 0;
+  setDetails("");
+  status("Cleared.");
+});
+
+document.getElementById("fitBtn").addEventListener("click", () => cy.fit());
+
+// Clicking a book adds subject nodes (only then)
+cy.on("tap", "node", async (evt) => {
+  const node = evt.target;
+  const kind = node.data("kind");
+
+  if (kind !== "book") return;
+
+  const bookIri = node.data("iri") || node.id();
+  const bookLabel = node.data("label") || shortLabel(bookIri);
+
+  node.select();
+  setDetails(`<b>Selected book:</b> ${bookLabel}<br/><span class="muted">${bookIri}</span>`);
+  status("Loading subjects for that book…");
+
+  try {
+    const subjJson = await sparql(subjectsForBookQuery(bookIri, 30));
+    const subjRows = subjJson?.results?.bindings || [];
+
+    if (!subjRows.length) {
+      status("That book has no subject values (or subject predicate differs).");
+      setDetails(`<b>Selected book:</b> ${bookLabel}<br/><span class="muted">No subjects found for this record.</span>`);
+      return;
+    }
+
+    let addedSubjects = 0;
+    for (const r of subjRows) {
+      const subjVal = r.subj?.value;
+      if (!subjVal) continue;
+
+      const subjId = "subject:" + subjVal.toLowerCase();
+      ensureNode(subjId, shortLabel(subjVal), "subject", { kind: "subject", subjectValue: subjVal });
+      ensureEdge(`${bookIri}|subject|${subjId}`, bookIri, subjId, "subject");
+      addedSubjects++;
+    }
+
+    relayout();
+    status(`Added ${addedSubjects} subject node(s). Click a subject to load more books in that subject.`);
+    setDetails(`<b>Selected book:</b> ${bookLabel}<br/><b>Subjects loaded:</b> ${addedSubjects}`);
+  } catch (e) {
+    status(e.message);
+  }
+});
+
+// Clicking a subject loads more books in same subject
+cy.on("tap", "node.subject", async (evt) => {
+  const subjVal = evt.target.data("subjectValue");
+  const subjLabel = evt.target.data("label") || shortLabel(subjVal);
+
+  if (!subjVal) return;
+
+  evt.target.select();
+  status(`Finding more books in subject "${subjLabel}"…`);
+  setDetails(`<b>Subject:</b> ${subjLabel}<br/><span class="muted">${subjVal}</span>`);
+
+  try {
+    const json = await sparql(booksByExactSubjectValueQuery(subjVal, 25));
+    const rows = json?.results?.bindings || [];
+
+    let added = 0;
+    for (const row of rows) {
+      const book = row.book?.value;
+      const title = row.title?.value;
+      if (!book) continue;
+
+      ensureNode(book, shortLabel(title || book), "book", { kind: "book", iri: book });
+      ensureEdge(`${evt.target.id()}|hasBook|${book}`, evt.target.id(), book, "has book");
+      added++;
+    }
+
+    relayout();
+    status(added ? `Added ${added} book(s) for subject "${subjLabel}".` : `No additional books found for subject "${subjLabel}".`);
+  } catch (e) {
+    status(e.message);
+  }
+});
+
+status('Type a search term (e.g. "psychology"). Default is Title. Click a book to reveal subjects.');
+</script>
+</body>
+</html>
